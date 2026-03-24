@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Snake</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto+Mono:wght@400;600&display=swap" rel="stylesheet" />
+</head>
+<body>
+
+  <!-- Header bar mimicking Google's product UI -->
+  <header class="header">
+    <div class="header-logo">
+      <span class="logo-g">G</span><span class="logo-o1">o</span><span class="logo-o2">o</span><span class="logo-g2">g</span><span class="logo-l">l</span><span class="logo-e">e</span>
+      <span class="logo-product">Snake</span>
+    </div>
+    <div class="header-score-area">
+      <span class="header-label">Score</span>
+      <span class="header-score-value" id="headerScore">0</span>
+    </div>
+  </header>
+
+  <!-- Main game container -->
+  <main class="main">
+    <div class="game-wrapper">
+
+      <!-- Score / High Score bar -->
+      <div class="score-bar">
+        <div class="score-block">
+          <span class="score-label">SCORE</span>
+          <span class="score-value" id="score">0</span>
+        </div>
+        <div class="score-block">
+          <span class="score-label">BEST</span>
+          <span class="score-value" id="highScore">0</span>
+        </div>
+        <div class="score-block">
+          <span class="score-label">LEVEL</span>
+          <span class="score-value" id="level">1</span>
+        </div>
+      </div>
+
+      <!-- Canvas area with decorative border -->
+      <div class="canvas-container">
+        <canvas id="gameCanvas" width="400" height="400"></canvas>
+
+        <!-- Overlay screens (start / pause / game-over) -->
+        <div class="overlay" id="overlay">
+          <div class="overlay-card" id="startScreen">
+            <div class="overlay-icon">🐍</div>
+            <h2 class="overlay-title">Snake</h2>
+            <p class="overlay-sub">Use arrow keys or WASD to move</p>
+            <button class="btn btn-primary" id="startBtn">Play</button>
+            <div class="difficulty-row">
+              <button class="btn btn-outline diff-btn active" data-speed="150">Easy</button>
+              <button class="btn btn-outline diff-btn" data-speed="100">Medium</button>
+              <button class="btn btn-outline diff-btn" data-speed="65">Hard</button>
+            </div>
+          </div>
+
+          <div class="overlay-card hidden" id="pauseScreen">
+            <div class="overlay-icon">⏸</div>
+            <h2 class="overlay-title">Paused</h2>
+            <button class="btn btn-primary" id="resumeBtn">Resume</button>
+            <button class="btn btn-outline" id="restartFromPauseBtn">Restart</button>
+          </div>
+
+          <div class="overlay-card hidden" id="gameOverScreen">
+            <div class="overlay-icon">💀</div>
+            <h2 class="overlay-title">Game Over</h2>
+            <p class="overlay-sub" id="finalScoreText">Score: 0</p>
+            <p class="overlay-best hidden" id="newBestText">🎉 New Best!</p>
+            <button class="btn btn-primary" id="retryBtn">Play Again</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Control hints -->
+      <div class="controls-hint">
+        <span><kbd>↑ ↓ ← →</kbd> Move</span>
+        <span><kbd>P</kbd> Pause</span>
+        <span><kbd>Space</kbd> Start / Resume</span>
+      </div>
+
+      <!-- Mobile D-pad -->
+      <div class="dpad" id="dpad">
+        <button class="dpad-btn dpad-up"    data-dir="UP">▲</button>
+        <button class="dpad-btn dpad-left"  data-dir="LEFT">◀</button>
+        <button class="dpad-btn dpad-center"></button>
+        <button class="dpad-btn dpad-right" data-dir="RIGHT">▶</button>
+        <button class="dpad-btn dpad-down"  data-dir="DOWN">▼</button>
+      </div>
+
+    </div>
+  </main>
+
+  <script src="game.js"></script>
+</body>
+</html>
