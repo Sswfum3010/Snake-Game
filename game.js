@@ -1,15 +1,15 @@
 /* ═══════════════════════════════════════════════════════════════
    Constants
 ═══════════════════════════════════════════════════════════════ */
-const COLS           = 20;
-const ROWS           = 20;
-const CELL           = 20;
-const CELL_HALF      = CELL >> 1;          // 10
-const CELL_INNER     = CELL - 2;           // 18 — segment draw size
-const CELL_INNER_HALF = CELL_INNER * 0.5;  // 9  — eliminates per-call multiply in drawSnake
-const TOTAL_CELLS    = COLS * ROWS;        // 400
+const COLS            = 20;
+const ROWS            = 20;
+const CELL            = 20;
+const CELL_HALF       = CELL >> 1;         // 10
+const CELL_INNER      = CELL - 2;          // 18 — segment draw size
+const CELL_INNER_HALF = CELL_INNER * 0.5;  // 9  — used in head-scale transform
+const TOTAL_CELLS     = COLS * ROWS;       // 400
 
-// Power-of-2 capacity → bitwise AND replaces modulo in RingDeque
+// Power-of-2 capacity enables bitwise AND in place of modulo inside RingDeque
 const RING_CAP  = 512;
 const RING_MASK = RING_CAP - 1;
 
@@ -19,11 +19,16 @@ const COMBO_WINDOW    = 8;   // max tick gap between eats to continue a combo
 const INPUT_QUEUE_MAX = 2;   // direction changes buffered ahead of steps
 const SPECIAL_EVERY   = 5;   // spawn special food every N regular foods eaten
 
+// Food circle geometry — r = CELL_HALF - 2 = 8 is a compile-time constant.
+// Precomputing the sub-highlight values avoids 3 multiplications per frame.
+const FOOD_R            = CELL_HALF - 2;        //  8
+const FOOD_SHINE_OFFSET = FOOD_R * 0.28;        //  2.24
+const FOOD_SHINE_R      = FOOD_R * 0.32;        //  2.56
+
 /* ═══════════════════════════════════════════════════════════════
    Shared, frozen direction vectors
-   DIR_MAP, DPAD_MAP, and the `direction` variable all reference the
-   same four objects, so enqueueDirection() can use identity equality
-   (d === ref) to detect duplicates in O(1) without value comparison.
+   All direction references throughout the file point to these four
+   objects, enabling O(1) identity checks (d === ref) in enqueueDirection.
 ═══════════════════════════════════════════════════════════════ */
 const D_UP    = Object.freeze({ x:  0, y: -1 });
 const D_DOWN  = Object.freeze({ x:  0, y:  1 });
@@ -39,13 +44,13 @@ const DIR_MAP = {
 
 const DPAD_MAP = { UP: D_UP, DOWN: D_DOWN, LEFT: D_LEFT, RIGHT: D_RIGHT };
 
-// Integer cell key — |0 encourages V8 to keep the value as a Smi
+// Integer cell key — |0 encourages V8 to represent the result as a Smi
 const pos2key = (x, y) => (y * COLS + x) | 0;
 
 /* ═══════════════════════════════════════════════════════════════
    Body colour lookup table
-   31 strings built once at startup; the draw loop indexes directly
-   into this array — zero string allocation per frame.
+   31 strings built once at startup. The draw loop indexes directly —
+   zero string allocation per frame.
    Gradient: near-head rgb(70,168,83) → tail rgb(70,198,83).
 ═══════════════════════════════════════════════════════════════ */
 const BODY_COLORS = Object.freeze(
@@ -53,8 +58,9 @@ const BODY_COLORS = Object.freeze(
 );
 
 /* ═══════════════════════════════════════════════════════════════
-   Star trig look-up tables
-   Replaces 10 × Math.cos + 10 × Math.sin per frame with 20 lookups.
+   Star trig look-up tables — precomputed once at startup.
+   Replaces 10 × Math.cos + 10 × Math.sin per animated frame
+   with 20 typed-array lookups.
 ═══════════════════════════════════════════════════════════════ */
 const STAR_COS = new Float64Array(10);
 const STAR_SIN = new Float64Array(10);
@@ -68,6 +74,10 @@ for (let i = 0; i < 10; i++) {
    RingDeque — O(1) pushFront / popBack on typed arrays.
    Power-of-2 capacity → bitwise AND instead of modulo.
    reset() reuses TypedArrays — zero allocation per game.
+
+   The overflow guard `if (size < RING_CAP)` has been removed:
+   TOTAL_CELLS(400) < RING_CAP(512) is a static guarantee, so the
+   guard was an unreachable dead branch that fired on every push.
 ═══════════════════════════════════════════════════════════════ */
 class RingDeque {
   constructor() {
@@ -84,13 +94,11 @@ class RingDeque {
     this._head           = (this._head - 1) & RING_MASK;
     this._xs[this._head] = x;
     this._ys[this._head] = y;
-    if (this._size < RING_CAP) this._size++;
+    this._size++;                  // no overflow guard needed: 400 < 512
   }
 
   popBack() { if (this._size > 0) this._size--; }
 
-  getX(i) { return this._xs[(this._head + i) & RING_MASK]; }
-  getY(i) { return this._ys[(this._head + i) & RING_MASK]; }
   headX() { return this._xs[this._head]; }
   headY() { return this._ys[this._head]; }
 
@@ -101,46 +109,63 @@ class RingDeque {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   2-slot input ring
+   Replaces the `inputQueue` JS array (with its `shift()` O(n)
+   mutation and heap pressure) with three scalar variables.
+   Maximum buffered inputs is INPUT_QUEUE_MAX = 2.
+     _iqLen = 0  → empty
+     _iqLen = 1  → one entry at _iq0
+     _iqLen = 2  → _iq0 is next to consume, _iq1 is last queued
+═══════════════════════════════════════════════════════════════ */
+let _iq0, _iq1, _iqLen = 0;
+
+function enqueueDirection(d) {
+  if (_iqLen >= INPUT_QUEUE_MAX) return;
+  // Compare against the last queued entry (or current direction if queue is empty)
+  const ref = _iqLen === 0 ? direction : (_iqLen === 1 ? _iq0 : _iq1);
+  if (d === ref) return;                         // identical direction — no-op
+  if (d.x === -ref.x && d.y === -ref.y) return; // 180° reversal — illegal
+  if (_iqLen === 0) _iq0 = d; else _iq1 = d;
+  _iqLen++;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    State
 ═══════════════════════════════════════════════════════════════ */
-const snake      = new RingDeque(); // allocated once — reset() per game
-const bodySet    = new Set();       // allocated once — clear() per game
-const inputQueue = [];              // allocated once — .length=0 per game
+const snake   = new RingDeque();
+const bodySet = new Set();
 
-let direction;   // one of D_UP / D_DOWN / D_LEFT / D_RIGHT
+let direction;
 
-// Food objects reused across games — no heap allocation per eat
+// Food objects reused every game — zero heap allocation per eat
 const _foodObj        = { x: 0, y: 0 };
 const _specialFoodObj = { x: 0, y: 0, ttl: 0 };
 let food;        // → _foodObj | null
 let specialFood; // → _specialFoodObj | null
-let foodsEaten;  // regular-food counter driving special-food cadence
+let foodsEaten;
 
 let score, highScore, level;
 let combo, lastEatTick, tickCount;
 let stepInterval, baseSpeed;
 
-let rafId, lastTimestamp, accumulator;
+let rafId = 0, lastTimestamp, accumulator;
 let gameState;   // 'idle' | 'running' | 'paused' | 'over' | 'dying'
 let eatAnimTick;
-let deathRafId;
+let deathRafId = 0;
 
 // Dirty flags — suppress textContent writes when values are unchanged
 let _domScore = -1, _domBest = -1, _domLevel = -1;
 
 /* ═══════════════════════════════════════════════════════════════
-   Canvas setup
-   CW / CH cached once — canvas dimensions never change at runtime.
+   Canvas setup — CW/CH cached once; canvas dimensions never change.
 ═══════════════════════════════════════════════════════════════ */
 const canvas = document.getElementById('gameCanvas');
 const ctx    = canvas.getContext('2d');
-const CW     = canvas.width;   // 400 — avoid repeated property reads
-const CH     = canvas.height;  // 400
+const CW     = canvas.width;
+const CH     = canvas.height;
 
 /* ═══════════════════════════════════════════════════════════════
-   Offscreen grid cache
-   Renders all 82 grid lines once; each frame blits them in a single
-   drawImage call instead of 82 stroke calls.
+   Offscreen grid cache — 82 lines rendered once, blitted each frame.
 ═══════════════════════════════════════════════════════════════ */
 const gridCanvas  = document.createElement('canvas');
 gridCanvas.width  = CW;
@@ -158,9 +183,8 @@ gridCanvas.height = CH;
 })();
 
 /* ═══════════════════════════════════════════════════════════════
-   roundRect shim
-   ctx.roundRect() is native in Chrome 99+, Firefox 112+, Safari 15.4+.
-   Falls back to quadraticCurveTo on older engines.
+   roundRect shim — native Chrome 99+/Firefox 112+/Safari 15.4+,
+   fallback via quadraticCurveTo on older engines.
 ═══════════════════════════════════════════════════════════════ */
 const _hasNativeRR = typeof ctx.roundRect === 'function';
 
@@ -184,9 +208,9 @@ function fillRoundRect(x, y, w, h, r) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Cached canvas bounding rect — invalidated by ResizeObserver.
-   Particle positioning uses this instead of calling getBoundingClientRect()
-   on every eat event, which forces a synchronous layout.
+   Cached canvas bounding rect
+   Invalidated by ResizeObserver; particle positioning uses this
+   instead of calling getBoundingClientRect() per eat (forces layout).
 ═══════════════════════════════════════════════════════════════ */
 let _canvasRect = canvas.getBoundingClientRect();
 new ResizeObserver(function() { _canvasRect = canvas.getBoundingClientRect(); }).observe(canvas);
@@ -209,9 +233,7 @@ const SCREEN_PANELS = { start: startScreen, pause: pauseScreen, gameover: gameOv
 let _visiblePanel = null;
 
 /* ═══════════════════════════════════════════════════════════════
-   Difficulty selector
-   diffBtns cached at module level — avoids re-querying the DOM
-   on every button click.
+   Difficulty selector — diffBtns cached to avoid repeated DOM queries
 ═══════════════════════════════════════════════════════════════ */
 baseSpeed = 150;
 const diffBtns = document.querySelectorAll('.diff-btn');
@@ -237,27 +259,29 @@ function setState(next) {
   switch (next) {
     case 'idle':   showScreen('start'); break;
     case 'paused': showScreen('pause'); break;
-    case 'dying':  runDeathAnimation(); break;
+
+    case 'dying':
+      // Stop the main loop for the ~600 ms death animation.
+      // runDeathAnimation() drives its own rAF; startGame() restarts rafLoop.
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+      runDeathAnimation();
+      break;
 
     case 'running':
       showScreen(null);
-      // Clear time debt so a long pause doesn't trigger a burst of steps on resume
       lastTimestamp = performance.now();
       accumulator   = 0;
       if (!rafId) rafId = requestAnimationFrame(rafLoop);
       break;
 
     case 'over': {
-      // Capture new-best flag before saveHighScore() mutates `highScore`
-      const isNewBest = score > highScore;
+      const isNewBest = score > highScore; // capture before saveHighScore mutates it
       saveHighScore();
       finalScoreText.textContent = 'Score: ' + score;
       newBestText.classList.toggle('hidden', !isNewBest);
       showScreen('gameover');
-      // Cancel the main loop — nothing to animate when the game-over overlay is up.
-      // startGame() restarts it via `if (!rafId)`.
-      cancelAnimationFrame(rafId);
-      rafId = 0;
+      // rafId was already cancelled in 'dying'; nothing to cancel here
       break;
     }
   }
@@ -271,15 +295,15 @@ function initGame() {
   const midY = ROWS >> 1;
 
   snake.reset();
-  snake.pushFront(midX - 1, midY); // body segment at index 1
+  snake.pushFront(midX - 1, midY); // body at index 1
   snake.pushFront(midX,     midY); // head at index 0
 
   bodySet.clear();
   bodySet.add(pos2key(midX,     midY));
   bodySet.add(pos2key(midX - 1, midY));
 
-  direction         = D_RIGHT;
-  inputQueue.length = 0; // truncate in place — reuses the array allocation
+  direction = D_RIGHT;
+  _iqLen    = 0; // flush 2-slot ring
 
   score        = 0;
   level        = 1;
@@ -292,7 +316,7 @@ function initGame() {
   specialFood  = null;
   stepInterval = baseSpeed;
 
-  _domScore = _domBest = _domLevel = -1; // force full UI refresh
+  _domScore = _domBest = _domLevel = -1;
 
   spawnFood();
   updateScoreUI();
@@ -301,9 +325,9 @@ function initGame() {
 /* ═══════════════════════════════════════════════════════════════
    Food spawning
    Dense board (>60% full): reservoir sampling (Algorithm R) —
-     O(n) single pass, provably uniform, no bodySet copy.
+     O(n), provably uniform, no bodySet copy.
    Sparse board: rejection sampling — O(1) expected.
-   Neither path allocates: _foodObj / _specialFoodObj are reused.
+   Reuses _foodObj / _specialFoodObj — zero heap allocation per eat.
 ═══════════════════════════════════════════════════════════════ */
 function spawnFood(isSpecial) {
   const otherFood = isSpecial ? food : specialFood;
@@ -314,7 +338,7 @@ function spawnFood(isSpecial) {
   let x, y;
 
   if (freeCount < TOTAL_CELLS * 0.4) {
-    // Algorithm R: visit every cell, replace chosen with probability 1/seen
+    // Algorithm R (k=1): each free cell gets probability exactly 1/seen
     let seen = 0, chosen = -1;
     for (let k = 0; k < TOTAL_CELLS; k++) {
       if (!bodySet.has(k) && k !== otherKey) {
@@ -343,24 +367,17 @@ function spawnFood(isSpecial) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Input queue
-   Identity comparison (d === ref) works because all direction values
-   are the same frozen D_* singletons throughout the codebase.
-═══════════════════════════════════════════════════════════════ */
-function enqueueDirection(d) {
-  if (inputQueue.length >= INPUT_QUEUE_MAX) return;
-  const ref = inputQueue.length ? inputQueue[inputQueue.length - 1] : direction;
-  if (d === ref) return;                         // same direction — no-op
-  if (d.x === -ref.x && d.y === -ref.y) return; // 180° reversal — illegal
-  inputQueue.push(d);
-}
-
-/* ═══════════════════════════════════════════════════════════════
    Game step — one fixed-timestep logic tick
 ═══════════════════════════════════════════════════════════════ */
 function step() {
   tickCount++;
-  if (inputQueue.length) direction = inputQueue.shift();
+
+  // Consume the oldest buffered direction from the 2-slot ring
+  if (_iqLen) {
+    direction = _iq0;
+    if (_iqLen === 2) _iq0 = _iq1;
+    _iqLen--;
+  }
 
   const hx = snake.headX() + direction.x;
   const hy = snake.headY() + direction.y;
@@ -368,14 +385,14 @@ function step() {
   // Wall collision
   if (hx < 0 || hx >= COLS || hy < 0 || hy >= ROWS) { setState('dying'); return; }
 
-  // The tail vacates its cell this tick. Remove it from bodySet before checking
-  // the new head so the snake can legally advance into its own departing tail.
+  // Remove the tail before self-collision check: tail vacates its cell this tick,
+  // so the head may legally advance into that cell.
   const tailKey = snake.tailKey();
   bodySet.delete(tailKey);
 
   const headKey = pos2key(hx, hy);
   if (bodySet.has(headKey)) {
-    bodySet.add(tailKey); // restore tail so death-flash renders the full body
+    bodySet.add(tailKey); // restore so death-flash renders the complete body
     setState('dying'); return;
   }
 
@@ -384,7 +401,7 @@ function step() {
 
   let ate = false;
 
-  // Regular food — guard against null in the pathological board-full edge case
+  // Regular food — null guard covers the pathological board-full edge case
   if (food && hx === food.x && hy === food.y) {
     ate         = true;
     eatAnimTick = tickCount;
@@ -397,8 +414,8 @@ function step() {
     showParticle(hx, hy, '+' + pts, combo > 1);
     spawnFood();
 
-    // Counter-based trigger prevents the score % 50 skip-over bug that arises
-    // when combo multipliers push score past a multiple of 50 in a single step.
+    // Counter-based trigger avoids the score % 50 skip-over bug that arises when
+    // combo multipliers cause score to jump past a multiple of 50 in one step.
     if (!specialFood && foodsEaten % SPECIAL_EVERY === 0) spawnFood(true);
   }
 
@@ -414,11 +431,11 @@ function step() {
   }
 
   if (!ate) {
-    snake.popBack(); // tail already removed from bodySet above
+    snake.popBack(); // tail cell already removed from bodySet above
   } else {
-    // Snake grew: the tail stays in the deque, so its cell must remain in bodySet.
-    // Without this restore, the tail cell is absent for one tick — a phantom gap
-    // that lets the snake head pass through the tip of its own body.
+    // Snake grew: tail stays in deque → its cell must stay in bodySet.
+    // Without this restore the tail cell is absent for one tick, creating a
+    // phantom passable gap at the tip of the body.
     bodySet.add(tailKey);
   }
 
@@ -434,14 +451,13 @@ function step() {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   RAF loop — fixed timestep, render every display frame.
-   draw() is guarded so it only fires when there is something
-   to paint:
+   RAF loop — fixed timestep; renders only when there is something
+   visible to paint.
      'running' → always draw
-     'paused'  → only when specialFood is animating (star pulse)
-     'dying'   → death animation owns its own draw() calls
-     'over'    → rafId cancelled in setState; loop never reaches here
-     'idle'    → loop runs but overlay fully covers the canvas; draw skipped
+     'paused'  → draw only when specialFood is pulsing
+     'dying'   → rafId is cancelled; this loop never fires
+     'over'    → rafId was cancelled in 'dying'; never fires
+     'idle'    → rafId never started; never fires
 ═══════════════════════════════════════════════════════════════ */
 function rafLoop(timestamp) {
   rafId = requestAnimationFrame(rafLoop);
@@ -455,9 +471,8 @@ function rafLoop(timestamp) {
       accumulator -= stepInterval;
       if (gameState !== 'running') break;
     }
-    // Guard: step() may have called setState('dying'), changing gameState.
-    // Drawing in that case would render one extra normal frame before the
-    // death flash begins, creating a visible glitch.
+    // step() may have transitioned to 'dying' (which cancelled rafId and started
+    // deathRafId). Guard so we do not render a normal frame after that transition.
     if (gameState === 'running') draw(timestamp);
   } else {
     lastTimestamp = timestamp;
@@ -467,12 +482,12 @@ function rafLoop(timestamp) {
 
 /* ═══════════════════════════════════════════════════════════════
    Death flash animation
-   Alternates red / normal over ~600 ms before transitioning to 'over'.
+   Alternates red/normal at 60 ms intervals for ~600 ms total.
 ═══════════════════════════════════════════════════════════════ */
 function runDeathAnimation() {
   let flashes = 0;
   const TOTAL = 10;
-  const STEP  = 60; // ms per flash frame
+  const STEP  = 60;
   let   prev  = performance.now();
 
   function frame(ts) {
@@ -491,14 +506,10 @@ function runDeathAnimation() {
 /* ═══════════════════════════════════════════════════════════════
    Rendering
 ═══════════════════════════════════════════════════════════════ */
-
-// Default parameters replace the `param = param || false` body assignments.
 function draw(timestamp = 0, deathFlash = false) {
-  // fillRect alone is sufficient — clearRect (transparent) before an opaque
-  // fillRect is redundant and wastes one canvas API call per frame.
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, CW, CH);
-  ctx.drawImage(gridCanvas, 0, 0); // blit pre-rendered grid
+  ctx.drawImage(gridCanvas, 0, 0);
 
   if (food)        drawFoodCircle(food.x, food.y);
   if (specialFood) drawSpecialFood(specialFood.x, specialFood.y, timestamp, specialFood.ttl / SPECIAL_TTL);
@@ -508,12 +519,15 @@ function draw(timestamp = 0, deathFlash = false) {
 function drawFoodCircle(col, row) {
   const cx = col * CELL + CELL_HALF;
   const cy = row * CELL + CELL_HALF;
-  const r  = CELL_HALF - 2;
 
   ctx.fillStyle = '#EA4335';
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, FOOD_R, 0, Math.PI * 2); ctx.fill();
+
+  // Sub-highlight uses precomputed constants — no per-frame multiplication
   ctx.fillStyle = '#f28b82';
-  ctx.beginPath(); ctx.arc(cx - r * .28, cy - r * .28, r * .32, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx - FOOD_SHINE_OFFSET, cy - FOOD_SHINE_OFFSET, FOOD_SHINE_R, 0, Math.PI * 2);
+  ctx.fill();
 }
 
 function drawSpecialFood(col, row, timestamp, urgency) {
@@ -523,14 +537,13 @@ function drawSpecialFood(col, row, timestamp, urgency) {
   const outer = (CELL_HALF - 1) * pulse;
   const inner = outer * 0.42;
 
-  // Save only globalAlpha instead of pushing the full canvas state with ctx.save().
-  // ctx.save/restore stores the entire state record (transform, clip, line settings,
-  // compositing, etc.) — far more than we need here.
-  const prevAlpha = ctx.globalAlpha;
-  ctx.globalAlpha = 0.35 + urgency * 0.65;
-  ctx.fillStyle   = '#FBBC05';
-  ctx.shadowColor = 'rgba(251,188,5,.8)';
-  ctx.shadowBlur  = 8;
+  // Manually save/restore only globalAlpha instead of ctx.save/restore,
+  // which pushes the entire state record (transform, clip, compositing, etc.).
+  const prevAlpha      = ctx.globalAlpha;
+  ctx.globalAlpha      = 0.35 + urgency * 0.65;
+  ctx.fillStyle        = '#FBBC05';
+  ctx.shadowColor      = 'rgba(251,188,5,.8)';
+  ctx.shadowBlur       = 8;
 
   ctx.beginPath();
   for (let i = 0; i < 10; i++) {
@@ -541,30 +554,45 @@ function drawSpecialFood(col, row, timestamp, urgency) {
   ctx.closePath();
   ctx.fill();
 
+  // Restore exactly what we changed; shadowColor must be reset so it doesn't
+  // linger in context state and affect subsequent semi-transparent draws.
   ctx.shadowBlur  = 0;
-  ctx.globalAlpha = prevAlpha; // restore only what we changed
+  ctx.shadowColor = 'transparent';
+  ctx.globalAlpha = prevAlpha;
 }
 
 function drawSnake(deathFlash) {
   const headScale = computeHeadScale();
   const len       = snake.length;
 
-  // Cache internal deque fields to avoid repeated property chain lookups per segment
+  // Cache internal deque fields for direct typed-array access — avoids
+  // property-chain lookups and the double (head+i) & RING_MASK that
+  // getX() + getY() would each compute separately.
   const head = snake._head;
   const xs   = snake._xs;
   const ys   = snake._ys;
 
+  if (deathFlash) {
+    // In death-flash mode all body segments share one colour. Set it once
+    // outside the loop; the head colour is the only per-iteration exception.
+    ctx.fillStyle = '#f28b82';
+  }
+
   for (let i = 0; i < len; i++) {
-    const idx = (head + i) & RING_MASK; // single bitwise op; avoids getX + getY duplication
+    const idx = (head + i) & RING_MASK;
     const px  = xs[idx] * CELL + 1;
     const py  = ys[idx] * CELL + 1;
 
     if (deathFlash) {
-      ctx.fillStyle = i === 0 ? '#EA4335' : '#f28b82';
+      // Only override fillStyle for the head; body was set before the loop
+      if (i === 0) ctx.fillStyle = '#EA4335';
+      else if (i === 1) ctx.fillStyle = '#f28b82'; // restore after head override
     } else if (i === 0) {
       ctx.fillStyle = '#34A853';
     } else {
-      ctx.fillStyle = BODY_COLORS[Math.min(30, (i / len * 30 + 0.5) | 0)];
+      // i/len is in [1/len, (len-1)/len) — always < 1, so the result of
+      // (i/len * 30 + 0.5)|0 is at most 30. Math.min(30, ...) is redundant.
+      ctx.fillStyle = BODY_COLORS[(i / len * 30 + 0.5) | 0];
     }
 
     if (i === 0 && headScale !== 1) {
@@ -582,7 +610,6 @@ function drawSnake(deathFlash) {
   if (!deathFlash) drawEyes();
 }
 
-// Interpolates a brief scale-up immediately after eating for tactile feedback
 function computeHeadScale() {
   const elapsed = tickCount - eatAnimTick;
   if (elapsed > 2) return 1;
@@ -602,7 +629,7 @@ function drawEyes() {
   else if (dy === -1) { e1x = cx - 3; e1y = cy - 4; e2x = cx + 3; e2y = cy - 4; }
   else                { e1x = cx - 3; e1y = cy + 4; e2x = cx + 3; e2y = cy + 4; }
 
-  // Batch same-colour draws: 2 fillStyle switches instead of 4
+  // Batch by colour: 2 fillStyle switches instead of 4
   ctx.fillStyle = '#fff';
   ctx.beginPath(); ctx.arc(e1x, e1y, 2.5, 0, Math.PI * 2); ctx.fill();
   ctx.beginPath(); ctx.arc(e2x, e2y, 2.5, 0, Math.PI * 2); ctx.fill();
@@ -615,25 +642,26 @@ function drawEyes() {
    UI helpers
 ═══════════════════════════════════════════════════════════════ */
 
-// Writes to DOM only when a value has actually changed
+// Skips textContent writes when numeric values haven't changed.
+// Assigning a number to textContent coerces it to string internally —
+// explicit String() conversion is unnecessary overhead.
 function updateScoreUI() {
   const best = score > highScore ? score : highScore;
-  if (score !== _domScore) { scoreEl.textContent = headerScoreEl.textContent = String(_domScore = score); }
-  if (best  !== _domBest)  { highScoreEl.textContent = String(_domBest = best); }
-  if (level !== _domLevel) { levelEl.textContent     = String(_domLevel = level); }
+  if (score !== _domScore) { scoreEl.textContent = headerScoreEl.textContent = (_domScore = score); }
+  if (best  !== _domBest)  { highScoreEl.textContent = (_domBest  = best);  }
+  if (level !== _domLevel) { levelEl.textContent     = (_domLevel = level); }
 }
 
 function saveHighScore() {
   if (score > highScore) {
     highScore = score;
     localStorage.setItem('snakeHighScore', highScore);
-    highScoreEl.textContent = String(highScore);
+    highScoreEl.textContent = highScore;
     _domBest = highScore;
   }
 }
 
-// Updates only the two elements that actually change (outgoing + incoming panel)
-// instead of bulk-toggling all three on every call.
+// Touches only the two panels that change (outgoing + incoming) per call
 function showScreen(which) {
   if (_visiblePanel !== null) {
     SCREEN_PANELS[_visiblePanel].classList.add('hidden');
@@ -654,9 +682,8 @@ function showParticle(col, row, text, isCombo) {
   if (isCombo) el.style.color = '#FBBC05';
   document.body.appendChild(el);
 
-  // Two-frame rAF: remove class in frame N, add in frame N+1.
-  // Allows the browser to process the style change between frames without
-  // a forced synchronous layout (which `void el.offsetWidth` would cause).
+  // Two-frame rAF: remove in frame N, add in frame N+1 — restarts the CSS
+  // animation without a forced synchronous layout (`void el.offsetWidth`).
   scoreEl.classList.remove('pop');
   requestAnimationFrame(function() { scoreEl.classList.add('pop'); });
 
@@ -668,11 +695,10 @@ function showParticle(col, row, text, isCombo) {
 ═══════════════════════════════════════════════════════════════ */
 function startGame() {
   cancelAnimationFrame(deathRafId);
-  deathRafId    = 0;
+  deathRafId = 0;
   initGame();
   lastTimestamp = performance.now();
   accumulator   = 0;
-  // rafId is 0 after 'over' state cancels it, so this always starts a fresh loop
   if (!rafId) rafId = requestAnimationFrame(rafLoop);
   setState('running');
 }
@@ -724,11 +750,11 @@ document.getElementById('retryBtn').addEventListener('click', startGame);
 document.getElementById('restartFromPauseBtn').addEventListener('click', startGame);
 
 /* ═══════════════════════════════════════════════════════════════
-   Mobile: D-pad (pointerdown for zero-latency response)
+   Mobile: D-pad
 ═══════════════════════════════════════════════════════════════ */
 document.querySelectorAll('.dpad-btn[data-dir]').forEach(function(btn) {
   btn.addEventListener('pointerdown', function(e) {
-    e.preventDefault(); // blocks ghost click on touch devices
+    e.preventDefault();
     const d = DPAD_MAP[btn.dataset.dir];
     if (!d) return;
     if (gameState === 'idle')   { startGame(); return; }
@@ -739,9 +765,8 @@ document.querySelectorAll('.dpad-btn[data-dir]').forEach(function(btn) {
 
 /* ═══════════════════════════════════════════════════════════════
    Mobile: canvas swipe
-   Two scalars instead of a {x,y} object allocation per touchstart.
-   touchcancel clears the flag so interrupted gestures (notifications,
-   incoming calls) never fire a phantom direction change.
+   Two scalars avoid a {x,y} allocation on every touchstart.
+   touchcancel clears the flag so interrupted gestures never fire.
 ═══════════════════════════════════════════════════════════════ */
 let _txStart = 0, _tyStart = 0, _touching = false;
 
@@ -758,7 +783,7 @@ canvas.addEventListener('touchend', function(e) {
   _touching = false;
   const dx = e.changedTouches[0].clientX - _txStart;
   const dy = e.changedTouches[0].clientY - _tyStart;
-  if (Math.abs(dx) < 12 && Math.abs(dy) < 12) return; // ignore taps
+  if (Math.abs(dx) < 12 && Math.abs(dy) < 12) return;
 
   const d = Math.abs(dx) > Math.abs(dy)
     ? (dx > 0 ? D_RIGHT : D_LEFT)
@@ -771,9 +796,11 @@ canvas.addEventListener('touchend', function(e) {
 
 /* ═══════════════════════════════════════════════════════════════
    Boot
+   The RAF loop is NOT started here. The idle state has nothing to
+   animate (specialFood is null, canvas is covered by the overlay).
+   startGame() owns the first requestAnimationFrame call via `if (!rafId)`.
 ═══════════════════════════════════════════════════════════════ */
 gameState = 'idle';
 initGame();
-draw(0);
+draw(0);         // render the initial board once before the overlay appears
 showScreen('start');
-rafId = requestAnimationFrame(rafLoop);
