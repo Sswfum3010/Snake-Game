@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════
-   Constants
+   Constants & Configuration
 ═══════════════════════════════════════════════════════════════ */
 const COLS            = 20;
 const ROWS            = 20;
@@ -8,6 +8,10 @@ const CELL_HALF       = CELL >> 1;         // 10
 const CELL_INNER      = CELL - 2;          // 18 — segment draw size
 const CELL_INNER_HALF = CELL_INNER * 0.5;  // 9  — used in head-scale transform
 const TOTAL_CELLS     = COLS * ROWS;       // 400
+
+// Logical canvas dimensions
+const CW = COLS * CELL;
+const CH = ROWS * CELL;
 
 // Power-of-2 capacity enables bitwise AND in place of modulo inside RingDeque
 const RING_CAP  = 512;
@@ -25,8 +29,7 @@ const FOOD_SHINE_OFFSET = FOOD_R * 0.28;        //  2.24
 const FOOD_SHINE_R      = FOOD_R * 0.32;        //  2.56
 
 /* ═══════════════════════════════════════════════════════════════
-   Shared, frozen direction vectors
-   All direction references point to these four objects for O(1) identity checks
+   Shared, frozen direction vectors (O(1) identity checks)
 ═══════════════════════════════════════════════════════════════ */
 const D_UP    = Object.freeze({ x:  0, y: -1 });
 const D_DOWN  = Object.freeze({ x:  0, y:  1 });
@@ -34,10 +37,10 @@ const D_LEFT  = Object.freeze({ x: -1, y:  0 });
 const D_RIGHT = Object.freeze({ x:  1, y:  0 });
 
 const DIR_MAP = {
-  ArrowUp: D_UP,     w: D_UP,
-  ArrowDown: D_DOWN, s: D_DOWN,
-  ArrowLeft: D_LEFT, a: D_LEFT,
-  ArrowRight: D_RIGHT, d: D_RIGHT,
+  ArrowUp: D_UP,     w: D_UP,    W: D_UP,
+  ArrowDown: D_DOWN, s: D_DOWN,  S: D_DOWN,
+  ArrowLeft: D_LEFT, a: D_LEFT,  A: D_LEFT,
+  ArrowRight: D_RIGHT, d: D_RIGHT, D: D_RIGHT,
 };
 
 const DPAD_MAP = { UP: D_UP, DOWN: D_DOWN, LEFT: D_LEFT, RIGHT: D_RIGHT };
@@ -46,17 +49,14 @@ const DPAD_MAP = { UP: D_UP, DOWN: D_DOWN, LEFT: D_LEFT, RIGHT: D_RIGHT };
 const pos2key = (x, y) => (y * COLS + x) | 0;
 
 /* ═══════════════════════════════════════════════════════════════
-   Body colour lookup table
-   31 strings built once at startup.
+   Look-up Tables
 ═══════════════════════════════════════════════════════════════ */
+// Body colors (31 strings built once at startup)
 const BODY_COLORS = Object.freeze(
-  Array.from({ length: 31 }, (_, i) => 'rgb(70,' + (168 + i) + ',83)')
+  Array.from({ length: 31 }, (_, i) => `rgb(70,${168 + i},83)`)
 );
 
-/* ═══════════════════════════════════════════════════════════════
-   Star trig look-up tables
-   Interleaved X and Y array to increase spatial locality during draw loop.
-═══════════════════════════════════════════════════════════════ */
+// Star trig look-up tables (Interleaved X and Y for spatial locality)
 const STAR_COORDS = new Float64Array(20);
 for (let i = 0; i < 10; i++) {
   const a = (Math.PI / 5) * i - Math.PI * 0.5;
@@ -66,7 +66,7 @@ for (let i = 0; i < 10; i++) {
 
 /* ═══════════════════════════════════════════════════════════════
    RingDeque — O(1) pushFront / popBack on typed arrays.
-   No heap allocations. Size tracks perfectly for usage as length.
+   Zero heap allocations during gameplay.
 ═══════════════════════════════════════════════════════════════ */
 class RingDeque {
   constructor() {
@@ -137,16 +137,20 @@ let deathRafId = 0;
 let _domScore = -1, _domBest = -1, _domLevel = -1;
 
 /* ═══════════════════════════════════════════════════════════════
-   Canvas setup
+   Canvas Setup (with DPI Scaling for Retina Displays)
 ═══════════════════════════════════════════════════════════════ */
 const canvas = document.getElementById('gameCanvas');
 const ctx    = canvas.getContext('2d');
-const CW     = canvas.width;
-const CH     = canvas.height;
+const dpr    = window.devicePixelRatio || 1;
+
+canvas.style.width  = CW + 'px';
+canvas.style.height = CH + 'px';
+canvas.width  = Math.floor(CW * dpr);
+canvas.height = Math.floor(CH * dpr);
+ctx.scale(dpr, dpr);
 
 /* ═══════════════════════════════════════════════════════════════
    Branchless roundRect polyfill
-   Forks definition at init; eliminates inside-loop feature checking.
 ═══════════════════════════════════════════════════════════════ */
 const fillRoundRect = typeof ctx.roundRect === 'function'
   ? function(x, y, w, h, r) {
@@ -171,30 +175,29 @@ const fillRoundRect = typeof ctx.roundRect === 'function'
 
 /* ═══════════════════════════════════════════════════════════════
    Offscreen grid renderer -> CSS Data URI blit override.
-   Draws canvas grid to a base64 background layout. Skips full blit on RAF.
+   Supports High DPI matching the main canvas.
 ═══════════════════════════════════════════════════════════════ */
 (function buildGrid() {
   const gridCanvas  = document.createElement('canvas');
-  gridCanvas.width  = CW;
-  gridCanvas.height = CH;
+  gridCanvas.width  = Math.floor(CW * dpr);
+  gridCanvas.height = Math.floor(CH * dpr);
+  
   const gx = gridCanvas.getContext('2d');
+  gx.scale(dpr, dpr);
   gx.strokeStyle = 'rgba(0,0,0,0.04)';
   gx.lineWidth   = 0.5;
+  
   for (let c = 0; c <= COLS; c++) {
     gx.beginPath(); gx.moveTo(c * CELL, 0); gx.lineTo(c * CELL, CH); gx.stroke();
   }
   for (let r = 0; r <= ROWS; r++) {
     gx.beginPath(); gx.moveTo(0, r * CELL); gx.lineTo(CW, r * CELL); gx.stroke();
   }
+  
   canvas.style.backgroundColor = '#fff';
   canvas.style.backgroundImage = `url(${gridCanvas.toDataURL()})`;
+  canvas.style.backgroundSize  = `${CW}px ${CH}px`;
 })();
-
-/* ═══════════════════════════════════════════════════════════════
-   Cached canvas bounding rect via ResizeObserver
-═══════════════════════════════════════════════════════════════ */
-let _canvasRect = canvas.getBoundingClientRect();
-new ResizeObserver(function() { _canvasRect = canvas.getBoundingClientRect(); }).observe(canvas);
 
 /* ═══════════════════════════════════════════════════════════════
    DOM references
@@ -456,7 +459,7 @@ function runDeathAnimation() {
    Rendering
 ═══════════════════════════════════════════════════════════════ */
 function draw(timestamp = 0, deathFlash = false) {
-  // Clear skips frame blending math due to static underlying CSS blit background
+  // Clear uses logical size because of ctx.scale()
   ctx.clearRect(0, 0, CW, CH);
 
   if (food)        drawFoodCircle(food.x, food.y);
@@ -611,17 +614,27 @@ function showScreen(which) {
 
 function showParticle(col, row, text, isCombo) {
   const el = document.createElement('div');
+  
+  // Calculate exact bounds right before injection to account for window scrolling
+  const rect = canvas.getBoundingClientRect();
+  
   el.className   = 'particle';
   el.textContent = text;
-  el.style.left  = (_canvasRect.left + col * CELL + CELL_HALF) + 'px';
-  el.style.top   = (_canvasRect.top  + row * CELL) + 'px';
+  el.style.left  = (rect.left + window.scrollX + col * CELL + CELL_HALF) + 'px';
+  el.style.top   = (rect.top  + window.scrollY + row * CELL) + 'px';
   if (isCombo) el.style.color = '#FBBC05';
+  
   document.body.appendChild(el);
 
+  // Force DOM reflow to securely restart CSS animation
   scoreEl.classList.remove('pop');
-  requestAnimationFrame(function() { scoreEl.classList.add('pop'); });
+  void scoreEl.offsetWidth; 
+  scoreEl.classList.add('pop');
 
-  el.addEventListener('animationend', function() { el.remove(); }, { once: true });
+  // Safely cleanup DOM element (Fallback if 'animationend' fails due to background tab)
+  const removeEl = () => { if (el.parentNode) el.remove(); };
+  el.addEventListener('animationend', removeEl, { once: true });
+  setTimeout(removeEl, 1000);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -688,6 +701,7 @@ document.querySelectorAll('.dpad-btn[data-dir]').forEach(function(btn) {
   });
 });
 
+/* Touch Events (Mobile Drag Optimization) */
 let _txStart = 0, _tyStart = 0, _touching = false;
 
 canvas.addEventListener('touchstart', function(e) {
@@ -695,6 +709,11 @@ canvas.addEventListener('touchstart', function(e) {
   _tyStart  = e.touches[0].clientY;
   _touching = true;
 }, { passive: true });
+
+// Prevent screen scrolling when swiping on the canvas
+canvas.addEventListener('touchmove', function(e) {
+  if (_touching) e.preventDefault();
+}, { passive: false });
 
 canvas.addEventListener('touchcancel', function() { _touching = false; }, { passive: true });
 
