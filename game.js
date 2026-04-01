@@ -106,7 +106,8 @@ function enqueueDirection(d) {
   if (_iqLen >= INPUT_QUEUE_MAX) return;
   const ref = _iqLen === 0 ? direction : (_iqLen === 1 ? _iq0 : _iq1);
   if (d === ref || (d.x === -ref.x && d.y === -ref.y)) return; 
-  if (_iqLen === 0) _iq0 = d; else _iq1 = d;
+  if (_iqLen === 0) _iq0 = d;
+  else _iq1 = d;
   _iqLen++;
 }
 
